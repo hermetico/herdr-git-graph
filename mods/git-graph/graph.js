@@ -26,8 +26,9 @@ function paneFrame(node) {
   return null;
 }
 
-function location(folder) {
-  if (folder) return { cwd: folder, on: null };
+// A pinned folder may live on another machine: props.machine names it.
+function location(folder, machine = null) {
+  if (folder) return { cwd: folder, on: machine };
   const space = spaces().find((s) => s.active), f = focused();
   const pane = f?.pane ? panes().find((p) => p.pane === f.pane) : null;
   const on = f?.pane === null ? (f.terminal?.includes("/") ? f.terminal.split("/")[0] : null) : space?.machine ?? null;
@@ -142,6 +143,7 @@ const tagsShown = () => shared("git-graph.tags") === true;
 export class Graph {
   init(cx) {
     this.folder = props()?.folder ?? null;
+    this.machine = props()?.machine ?? null;
     // A scrollbar finds its list by name: each copy (panel, pane) needs its own.
     this.listId = `graph-rows-${Math.random().toString(36).slice(2)}`;
     this.diffId = `${this.listId}-diff`;
@@ -166,7 +168,7 @@ export class Graph {
     check();
   }
 
-  key() { return JSON.stringify(location(this.folder)); }
+  key() { return JSON.stringify(location(this.folder, this.machine)); }
 
   reset() {
     Object.assign(this, folderState());
@@ -218,7 +220,7 @@ export class Graph {
   // load for the old one finds itself stale and drops its result.
   // timer: the 15 s re-read, which doesn't search a folder again that held no repositories.
   refresh(cx, full = true, timer = false) {
-    const { cwd, on } = location(this.folder), context = this.key();
+    const { cwd, on } = location(this.folder, this.machine), context = this.key();
     if (context !== this.context) { this.enter(context); full = true; }
     if (!cwd) { this.state = "nofolder"; return; }
     // A repository opened from the Manygit list loads in place of the folder.
@@ -667,6 +669,9 @@ export class Graph {
     const settingsShown = this.state === "workspace" || (this.state === "norepo" && !this.skipped);
     return h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
       .when(!repo, (e) => e.child(div().text_size(13).font_semibold().child(ws ? "Manygit" : "Git")))
+      // The repository's folder name beside the title.
+      .when(!ws && Boolean(this.root), (e) => e.child(h_flex().h(22).px(7).gap(5).min_w(0).items_center().rounded(6).bg(t.raised).text_color(t.foreground)
+        .child(svg(icon("folder")).size(12).flex_none()).child(div().min_w(0).truncate().text_size(11.5).font_semibold().child(String(this.root).replace(/\/+$/, "").split("/").pop()))))
       .when(Boolean(repo), (e) => e
         .child(h_flex().id("graph-back").h(24).pl(2).pr(6).gap(3).flex_none().items_center().rounded(6).cursor_pointer()
           .hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.back(cx))
