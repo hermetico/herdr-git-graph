@@ -119,7 +119,22 @@ Top to bottom:
   - With more history, a last row `Load 300 more commits` in `accent`. Scrolling
     it into view loads the next 300, as Git Graph does (`Loading more commits…`
     meanwhile); a click does the same.
-- **Details**, under the list when a commit is selected. 320px tall by default,
+- **Drawer**, the default place for a selected commit's details (shared state
+  `git-graph.view`: `drawer` or `panel`). It opens inside the history, right under
+  the commit, as items of the same virtual list, so it scrolls with the rows. A
+  commit picked in the lower half scrolls to the top so its drawer shows. It is a
+  box beside the graph column on `chrome`, with a `border` on its left, top and
+  bottom edges; the lanes that run past the commit carry on through the graph
+  column, painted as the graph's own lines. A 24px top line holds `Panel` and `×`
+  on the right, then 20px lines: on the left the subject semibold, Commit (click
+  copies the hash), Parents (click jumps to the first), Author, Date, Committer when
+  different, then the body wrapped in monospace to fit; on the right, 40% of the
+  width between 220 and 460px past a `border`, `N files +a −d` and the files as a
+  tree, folders first, a folder with one subfolder and no files merged into one
+  path. Below 520px the files go under the details. A file opens its diff in the
+  drawer: a 28px line with `← Files`, the path, `Panel` and `×`, then the diff's
+  20px rows, cut at the edge. A click in the drawer is placed by its x.
+- **Details panel**, with `git-graph.view` set to `panel`: under the list when a commit is selected. 320px tall by default,
   and taller when the history leaves more room than that, so a short history
   doesn't sit above an empty gap (never under 120px, and always leaving the list
   room for three commits, so under 320px when the pane is short). Its top edge is a 6px grip with
@@ -127,7 +142,7 @@ Top to bottom:
   double-clicking it goes back to the automatic one, and it is kept in shared
   state (`git-graph.details`, 0 for automatic) as the columns are. A 32px
   bar with `Commit <8 chars>` (or `Uncommitted changes` and an `Open Changes`
-  link) and a `×`. Below, scrolling: the subject semibold, then label/value rows
+  link), a `Drawer` link back to the drawer, and a `×`. Below, scrolling: the subject semibold, then label/value rows
   at 11.5px (64px `dim` labels): Commit (full hash, monospace, `accent`),
   Parents, Author `name <email>`, Date (`2026-10-28 12:09 · 2d`). These come from
   the history already loaded, so they show the moment the commit is clicked, with

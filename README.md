@@ -47,9 +47,14 @@ extension).
   - uncommitted changes: commit (staging every change first, or only what's
     staged), stash, reset, show them in Herdr's Changes panel
 - **Commit details.** Click a commit for its message, hash, parents, author, date
-  and changed files; click a file for its diff. The top edge of the details
-  drags to make it taller or shorter (double-click it for the automatic height),
-  and it fills the room a short history leaves instead of keeping a gap above.
+  and changed files; click a file for its diff. By default they open in a drawer
+  right under the commit, as in VS Code's Git Graph: the details on the left, the
+  files as a folder tree on the right, the lanes running on past it. Click the hash
+  to copy it, or a parent to jump to it. **Panel** in the drawer switches to a strip
+  under the history instead, whose top edge drags to make it taller or shorter;
+  **Drawer** there switches back.
+- **A tab of its own.** The tab button in the header moves a graph pane to a new
+  tab, still pinned to its folder and machine; from the side panel it opens one.
 - **Live.** It reloads when refs move (a commit, checkout or fetch from any
   terminal), refreshes the uncommitted row as you edit, and fetches with one
   button. 300 commits at first, and 300 more each time you scroll to the end.

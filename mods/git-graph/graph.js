@@ -2,9 +2,10 @@
 // commit) for the focused pane's repository, or `props.folder` when opened as
 // a pane. Labels take double-clicks (checkout) and right-clicks (menus).
 import { div, svg, PathBuilder } from "gpui-kit";
-import { v_flex, h_flex, Scrollbar, v_virtual_list } from "gpui-base";
-import { spaces, panes, focused, layout, exec, watchFolder, readTextFile, theme, settings, props, shared, setShared, openOverlay, home, notify, knownAgents, updates } from "herdr";
+import { v_flex, h_flex, Scrollbar, v_virtual_list, VirtualListScrollHandle } from "gpui-base";
+import { spaces, panes, focused, layout, exec, watchFolder, readTextFile, theme, settings, props, shared, setShared, openOverlay, home, notify, knownAgents, updates, run } from "herdr";
 import { layoutLanes } from "./lanes.js";
+import { fileTree, wrapText } from "./drawer.js";
 import { READ, STATUS, UNCOMMITTED, LABEL, logArgs, parseLog, parseStatus, withUncommitted, labelsOf, hitLabel,
   menuFor, menuHeight, fileArgs, joinFiles, diffArgs, diffRows } from "./git.js";
 import { perform, openDialog, showChanges } from "./act.js";
@@ -49,6 +50,12 @@ const GRAPH_MIN = 56;
 const DETAIL_DEFAULT = 320, DETAIL_MIN = 120, DETAIL_ROWS = 3;
 // Above the list and the strip: the header (42), the toolbar (34) and the column headings (24), plus the border.
 const CHROME_H = 102;
+// The commit drawer opens under the selected commit, inside the history: one list item per line.
+// Details sit on the left and the files on the right, or one above the other below SPLIT_MIN wide.
+// FILES_W is the files column's share of the drawer, between FILES_MIN and FILES_MAX.
+const DRAWER_ROW = 20, DRAWER_HEAD = 24, DRAWER_PAD = 8, SPLIT_MIN = 520, FILES_W = 0.4, FILES_MIN = 220, FILES_MAX = 460, INDENT = 14;
+// A mono character's width, as a share of the font size: the message wraps at what fits.
+const MONO_CH = 0.6;
 // side: which way a drag widens it. Graph's handle is on its right edge, the others' on their left.
 const COLUMNS = { graph: { width: null, min: 24, side: 1 }, date: { width: 62, min: 36, max: 240, side: -1 },
   author: { width: 120, min: 50, max: 400, side: -1 }, hash: { width: 66, min: 40, max: 200, side: -1 } };
@@ -146,11 +153,12 @@ export class Graph {
     this.machine = props()?.machine ?? null;
     // A scrollbar finds its list by name: each copy (panel, pane) needs its own.
     this.listId = `graph-rows-${Math.random().toString(36).slice(2)}`;
-    this.diffId = `${this.listId}-diff`;
     this.all = true; this.remotes = true; this.wide = false; this.graphMax = 160; this.scale = null;
     this.watchToken = 0; this.seenChange = shared("git-graph.changed");
     this.cols = withDefaults(); this.drag = null;
+    this.diffId = `${this.listId}-diff`;
     this.detail = Number(shared("git-graph.details")) || 0; this.seenDetail = this.detail;
+    this.scroll = VirtualListScrollHandle.new(); this.visible = null; this.drawerKeys = new Map(); this.drawerCache = null;
     this.seen = new Map(); this.commitDetails = new Map();
     // Fetch all: its progress for one Manygit folder, and each repository's last failure.
     this.fetchAll = null; this.fetchErrors = new Map();
@@ -485,6 +493,11 @@ export class Graph {
     this.drag = { axis: "y", y: e.position.y, from: this.detailHeight() };
   }
   saveDetail() { this.seenDetail = this.detail; setShared("git-graph.details", this.detail); }
+  // Where a commit's details open: "drawer" under the commit, or "panel" in the strip under the
+  // history. Every copy follows the same choice.
+  view() { return shared("git-graph.view") === "panel" ? "panel" : "drawer"; }
+  setView(view, cx) { setShared("git-graph.view", view); cx.notify(); }
+
   // Where the description column ends: labels past it are clipped, so not clickable.
   labelLimit() {
     if (!this.width) return Infinity;
@@ -507,6 +520,7 @@ export class Graph {
   clicked(key, cx) {
     const press = this.press; this.press = null;
     if (key === "more") return this.loadMore(cx);
+    if (key.startsWith("drawer:")) return this.drawerClick(key, press, cx);
     const commit = this.commits[this.index.get(key)];
     if (!commit) return;
     if (press?.count >= 2) {
@@ -544,7 +558,42 @@ export class Graph {
     if (this.selected === commit.hash) { this.selected = null; this.details = null; this.diff = null; cx.notify(); return; }
     this.selected = commit.hash; this.details = null; this.diff = null;
     this.loadDetails(commit, cx);
+    this.reveal(this.index.get(commit.hash));
     this.handle.focus();
+    cx.notify();
+  }
+
+  // A commit picked in the lower half of the history scrolls to the top, so its drawer opens in view.
+  // The visible range counts the old drawer's lines when it was above the commit.
+  reveal(i) {
+    const v = this.visible, old = this.lastDrawer;
+    if (i === undefined || !v) return;
+    const at = old && old.sel < i ? i + old.len : i;
+    if (at > v.start + (v.end - v.start) / 2) this.scroll.scroll_to_item(i, "top");
+  }
+
+  // A click in the drawer: the list names the line, the press's x says which column it hit.
+  drawerClick(key, press, cx) {
+    const item = this.drawerKeys.get(key), commit = this.commits[this.index.get(this.selected)];
+    if (!item || !commit) return;
+    const x = press?.x ?? 0;
+    let act = null;
+    if (item.kind === "head" || item.kind === "diffhead") {
+      act = x >= item.closeFrom ? { close: true } : x >= item.panelFrom ? { panel: true } : item.kind === "diffhead" && x < item.backTo ? { back: true } : null;
+    }
+    else act = (item.split !== null && x >= item.split ? item.right : item.left)?.act ?? null;
+    if (!act) return;
+    if (act.panel) return this.setView("panel", cx);
+    if (act.back) this.diff = null;
+    else if (act.close) { this.selected = null; this.details = null; this.diff = null; }
+    else if (act.diff) return this.openDiff(commit, act.diff, cx);
+    else if (act.changes) return showChanges();
+    else if (act.copy) { cx.write_to_clipboard(act.copy); notify({ title: "Git Graph", body: `Copied ${act.copy.slice(0, 12)}` }); return; }
+    else if (act.select) {
+      const parent = this.commits[this.index.get(act.select)];
+      if (!parent) { notify({ title: "Git Graph", body: "That commit isn't loaded yet: scroll down to load more.", level: "warning" }); return; }
+      return this.pick(parent, cx);
+    }
     cx.notify();
   }
 
@@ -692,8 +741,25 @@ export class Graph {
         const run = this.fetchAll?.root === ws.root ? this.fetchAll : null;
         return e.child(this.iconButton("graph-fetch-all", "fetch", run ? `Fetching ${run.done}/${run.total}…` : "Fetch all", Boolean(run), (_e, cx) => this.fetchEvery(cx), t));
       })
+      .when(this.canMoveToTab(), (e) => e.child(this.iconButton("graph-tab", "tab", null, false, () => this.moveToTab(), t)))
       .when(this.state !== "nofolder", (e) => e.child(this.iconButton("graph-refresh", "refresh", null, false, (_e, cx) => this.refresh(cx), t)))
       .when(settingsShown, (e) => e.child(this.iconButton("graph-settings", "settings", null, false, () => this.openSettings(), t)));
+  }
+
+  // A pane pinned to a folder moves to a tab of its own; the side panel opens one and stays.
+  // A pane already alone in its tab has nowhere better to go.
+  canMoveToTab() {
+    if (!(this.opened ?? this.root)) return false;
+    if (!this.folder) return true;
+    const tab = focused()?.tab;
+    return panes().filter((p) => p.tab === tab).length > 1;
+  }
+
+  moveToTab() {
+    const folder = this.opened ?? this.root, tab = focused()?.tab;
+    if (!folder) return;
+    run("tab.new", { name: String(folder).replace(/\/+$/, "").split("/").pop(), mod: "git-graph", props: { folder, machine: this.on ?? null } });
+    if (this.folder && tab) for (const p of panes()) if (p.tab === tab && p.mod === "git-graph") run("pane.close", { pane: p.pane });
   }
 
   openSettings() {
@@ -799,26 +865,182 @@ export class Graph {
   }
 
   list(t, mono) {
-    const colors = laneColors(t), width = this.graphWidth(), count = this.commits.length + (this.hasMore ? 1 : 0);
+    const colors = laneColors(t), width = this.graphWidth();
+    // The drawer's lines sit right after the selected commit, as items of the same list.
+    const sel = this.selected ? this.index.get(this.selected) : undefined;
+    const drawer = sel === undefined || this.view() !== "drawer" ? [] : this.drawerItems(this.commits[sel], width);
+    this.drawerKeys = new Map(drawer.map((d) => [d.key, d]));
+    this.lastDrawer = drawer.length ? { sel, len: drawer.length } : null;
+    const n = drawer.length, total = this.commits.length + n, count = total + (this.hasMore ? 1 : 0);
+    const at = (i) => (sel === undefined || i <= sel ? { commit: i } : i <= sel + n ? { drawer: drawer[i - sel - 1] } : i < total ? { commit: i - n } : { more: true });
+    const sizes = n ? Array.from({ length: count }, (_x, i) => { const a = at(i); return a.drawer ? this.listSize(a.drawer.h) : this.listRow(); }) : this.listRow();
+    const lanes = n ? this.throughLanes(sel, colors, t) : [];
     return div().flex_1().min_h(0).relative()
       .on_mouse_down("left", (e) => { this.press = { x: (e.local_position?.x ?? 0) / this.unit(), count: e.click_count }; })
-      .child(v_virtual_list(this.listId, count, this.listRow(), (i) => this.commits[i]?.hash ?? "more",
+      .child(v_virtual_list(this.listId, count, sizes, (i) => { const a = at(i); return a.drawer ? a.drawer.key : a.more ? "more" : this.commits[a.commit].hash; },
         (range, cx) => {
+          this.visible = range;
           // Scrolling to the end loads the next page, as Git Graph does; the row also takes a click.
-          if (range.end > this.commits.length && this.hasMore && !this.loading && this.moreAsked !== this.limit) {
+          if (range.end > total && this.hasMore && !this.loading && this.moreAsked !== this.limit) {
             this.moreAsked = this.limit;
             cx.spawn(async (cx) => this.loadMore(cx));
           }
-          return Array.from({ length: range.end - range.start }, (_x, k) => range.start + k).map((i) => i < this.commits.length
-            ? this.row(i, t, colors, mono, width)
+          return Array.from({ length: range.end - range.start }, (_x, k) => at(range.start + k)).map((a) => a.drawer
+            ? this.drawerRow(a.drawer, t, mono, width, lanes)
+            : !a.more ? this.row(a.commit, t, colors, mono, width)
             : div().id("graph-more").h(this.rowH()).flex_none().px(14).flex().items_center().text_color(t.accent).hover((s) => s.bg(t.hover))
               .child(this.loading ? "Loading more commits…" : `Load ${PAGE} more commits`));
         })
+        .track_scroll(this.scroll)
         // Rows of a virtual list can't hold their own handlers: the list reports the row's key.
         .on_item_click((key, cx) => this.clicked(key, cx))
         .on_item_secondary_click((key, e, cx) => this.contextMenu(key, e, cx))
         .size_full())
       .child(Scrollbar.vertical(this.listId).viewport_from_layout().absolute().inset_0());
+  }
+
+  // An item's height in the list's units: as the rows, screen pixels where Herdr doesn't zoom lists.
+  listSize(h) { return listsZoom() ? h : Math.max(1, Math.round(h * (settings().zoom ?? 1))); }
+
+  // The lanes that run on past the selected commit: the drawer carries them down to the next row.
+  throughLanes(sel, colors, t) {
+    const seen = new Set(), out = [];
+    for (const [, , b, yb, c, dashed] of this.rows[sel]?.segments ?? []) {
+      if (yb !== 1 || seen.has(b)) continue;
+      seen.add(b);
+      out.push({ lane: b, color: dashed ? t.dim : colors[c % colors.length] });
+    }
+    return out;
+  }
+
+  // Where the drawer's columns fall: its content starts after the graph column, the files take
+  // the right part when there's room. x values are in the list's own coordinates.
+  drawerGeometry(graphW) {
+    const start = graphW + LABEL.GAP, w = Math.max(200, (this.width ?? 600) - 2 - start - 10);
+    if (w < SPLIT_MIN - start) return { start, w, split: null, filesW: w };
+    const filesW = Math.round(Math.max(FILES_MIN, Math.min(FILES_MAX, w * FILES_W)));
+    return { start, w, split: start + w - filesW, filesW };
+  }
+
+  // The left column: the subject, the commit's fields, then its message wrapped to fit.
+  detailLines(commit, d, chars) {
+    if (d?.error) return [{ text: d.error, color: "ansi1" }];
+    if (commit.uncommitted) return [{ text: "Uncommitted changes", bold: true }, { text: "Open Changes", color: "accent", act: { changes: true } }];
+    const lines = [
+      { text: commit.subject, bold: true },
+      { key: "Commit", value: commit.hash, color: "accent", mono: true, act: { copy: commit.hash } },
+      { key: "Parents", value: commit.parents.map((p) => p.slice(0, 8)).join(", ") || "none", color: commit.parents.length ? "accent" : null, act: commit.parents.length ? { select: commit.parents[0] } : null },
+      { key: "Author", value: `${commit.author} <${commit.email}>` },
+      { key: "Date", value: `${stamp(commit.time)} · ${ago(commit.time)}` },
+    ];
+    if (d?.committer && d.committer !== commit.author) lines.push({ key: "Committer", value: d.committer });
+    const body = d ? d.message.split("\n").slice(1).join("\n").trim() : "";
+    if (body) lines.push({ text: "" }, ...wrapText(body, chars).map((text) => ({ text, mono: true, color: "muted" })));
+    return lines;
+  }
+
+  // The right column: a summary, then the files as a tree. A file opens its diff.
+  fileLines(d) {
+    if (!d) return [{ text: "Loading files…", color: "dim" }];
+    if (d.error) return [];
+    const add = d.files.reduce((n, f) => n + f.add, 0), del = d.files.reduce((n, f) => n + f.del, 0);
+    return [
+      { summary: { files: d.files.length + d.more, add, del } },
+      ...fileTree(d.files).map((e) => (e.kind === "file" ? { entry: e, act: { diff: e.file } } : { entry: e })),
+      ...(d.more > 0 ? [{ text: `and ${d.more} more`, color: "dim" }] : []),
+    ];
+  }
+
+  // Built again only when what it shows changes, not on every frame.
+  drawerItems(commit, graphW) {
+    const c = this.drawerCache;
+    if (c && c.commit === commit && c.details === this.details && c.diff === this.diff && c.graphW === graphW && c.width === this.width) return c.items;
+    const items = this.buildDrawer(commit, graphW);
+    this.drawerCache = { commit, details: this.details, diff: this.diff, graphW, width: this.width, items };
+    return items;
+  }
+
+  buildDrawer(commit, graphW) {
+    const g = this.drawerGeometry(graphW), base = `drawer:${commit.hash}`;
+    const head = { key: `${base}:head`, kind: "head", h: DRAWER_HEAD, split: null, panelFrom: g.start + g.w - 72, closeFrom: g.start + g.w - 22 };
+    const pad = (k) => ({ key: `${base}:${k}`, kind: "pad", h: DRAWER_PAD, split: null, edge: k });
+    if (this.diff) {
+      const rows = this.diff.rows ?? [{ kind: "", text: "Loading diff…" }];
+      return [
+        { key: `${base}:diffhead`, kind: "diffhead", h: 28, split: null, backTo: g.start + 72, panelFrom: g.start + g.w - 72, closeFrom: g.start + g.w - 22 },
+        ...rows.map((row, i) => ({ key: `${base}:diff:${i}`, kind: "diff", h: DIFF_ROW, split: null, row })),
+        pad("bottom"),
+      ];
+    }
+    const leftW = g.split === null ? g.w : g.split - g.start - 12;
+    const left = this.detailLines(commit, this.details, (leftW - 12) / (11.5 * MONO_CH)), right = this.fileLines(this.details);
+    const lines = g.split === null
+      ? [...left.map((c) => ({ left: c })), { left: { text: "" } }, ...right.map((c) => ({ left: c }))]
+      : Array.from({ length: Math.max(left.length, right.length) }, (_x, i) => ({ left: left[i] ?? null, right: right[i] ?? null }));
+    return [head, ...lines.map((l, i) => ({ key: `${base}:${i}`, kind: "line", h: DRAWER_ROW, split: g.split, filesW: g.filesW, ...l })), pad("bottom")];
+  }
+
+  drawerCell(c, t, mono) {
+    if (!c) return div();
+    const color = (name) => (name ? t[name] ?? name : null);
+    const link = (e) => (c.act ? e.cursor_pointer().hover((s) => s.text_color(t.foreground)) : e);
+    if (c.key) {
+      return h_flex().min_w(0).gap(8).items_center()
+        .child(div().w(64).flex_none().text_color(t.dim).child(c.key))
+        .child(link(div().min_w(0).truncate().when(Boolean(c.mono), (e) => e.font_family(mono)).text_color(color(c.color) ?? t.muted).child(c.value)));
+    }
+    if (c.summary) {
+      const { files, add, del } = c.summary;
+      return h_flex().gap(8).items_center()
+        .child(div().text_color(t.muted).child(count(files, "file")))
+        .when(add > 0, (e) => e.child(div().text_color(t.ansi2).child(`+${add}`)))
+        .when(del > 0, (e) => e.child(div().text_color(t.ansi1).child(`−${del}`)));
+    }
+    if (c.entry?.kind === "folder") {
+      return h_flex().min_w(0).pl(c.entry.depth * INDENT).gap(5).items_center().text_color(t.muted)
+        .child(svg(icon("folder")).size(12).flex_none()).child(div().min_w(0).truncate().child(c.entry.name));
+    }
+    if (c.entry) {
+      const f = c.entry.file, sc = f.status === "A" ? t.ansi2 : f.status === "D" || f.status === "U" ? t.ansi1 : t.blocked;
+      return h_flex().w_full().min_w(0).pl(c.entry.depth * INDENT).gap(6).items_center().cursor_pointer().rounded(4).hover((s) => s.bg(t.hover))
+        .child(div().w(12).flex_none().text_size(11).text_color(sc).child(f.status))
+        .child(div().flex_1().min_w(0).truncate().text_color(t.accent).child(c.entry.name))
+        .when(f.add > 0, (e) => e.child(div().flex_none().text_size(11).text_color(t.ansi2).child(`+${f.add}`)))
+        .when(f.del > 0, (e) => e.child(div().flex_none().text_size(11).text_color(t.ansi1).child(`−${f.del}`)));
+    }
+    return link(div().min_w(0).truncate().when(Boolean(c.bold), (e) => e.font_semibold()).when(Boolean(c.mono), (e) => e.font_family(mono).text_size(11.5))
+      .text_color(color(c.color) ?? t.foreground).child(c.text || " "));
+  }
+
+  // One line of the drawer: the lanes carried on in the graph column, then its content.
+  drawerRow(item, t, mono, graphW, lanes) {
+    // Painted as the graph's own lines are, so they meet them exactly.
+    const z = this.pathScale(), x = (lane) => (PAD + lane * LANE + LANE / 2) * z;
+    const graph = div().relative().flex_none().w(graphW).h(item.h).overflow_hidden()
+      .children(lanes.map((l) => window.paint_path(PathBuilder.stroke(1.5 * z).move_to(x(l.lane), 0).line_to(x(l.lane), item.h * z).build(), l.color)
+        .absolute().top(0).left(0).size_full()));
+    // The drawer is a box beside the graph column: its background and its edges start after the
+    // lanes, so they run through it unbroken and the box keeps one shape.
+    const row = (body) => h_flex().id(item.key).w_full().h(item.h).flex_none().overflow_hidden().text_size(11.5)
+      .child(graph).child(body);
+    const body = h_flex().flex_1().min_w(0).h_full().pl(LABEL.GAP).pr(10).gap(LABEL.GAP).items_center()
+      .bg(t.chrome ?? t.raised).border_l(1).border_color(t.border)
+      .when(item.edge === "bottom", (e) => e.border_b(1).border_color(t.border))
+      .when(item.kind === "head" || item.kind === "diffhead", (e) => e.border_t(1).border_color(t.border));
+    if (item.kind === "pad") return row(body);
+    const link = (text, w) => div().w(w).flex_none().text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground)).child(text);
+    const tail = (e) => e.child(link("Panel", 72 - 22 - LABEL.GAP).text_right()).child(link("×", 22 - LABEL.GAP).text_center());
+    if (item.kind === "head") return row(tail(body.child(div().flex_1())));
+    if (item.kind === "diffhead") {
+      return row(tail(body
+        .child(div().w(72 - LABEL.GAP).flex_none().text_color(t.muted).cursor_pointer().hover((s) => s.text_color(t.foreground)).child("← Files"))
+        .child(div().flex_1().min_w(0).truncate().font_family(mono).text_color(t.foreground).child(this.diff?.path ?? ""))));
+    }
+    if (item.kind === "diff") return row(body.font_family(mono).text_size(11).child(div().flex_1().min_w(0).h_full().child(this.diffRow(item.row, t))));
+    return row(body
+      .child(div().flex_1().min_w(0).child(this.drawerCell(item.left, t, mono)))
+      .when(item.split !== null, (e) => e.child(div().w(item.filesW).flex_none().h_full().pl(10).border_l(1).border_color(t.border).flex().items_center()
+        .child(this.drawerCell(item.right, t, mono)))));
   }
 
   detailsPane(t, mono) {
@@ -831,13 +1053,15 @@ export class Graph {
     const top = h_flex().h(32).flex_none().px(10).gap(6).items_center().border_b(1).border_color(t.border).text_size(11.5);
     const close = div().id("graph-details-close").px(6).py(1).rounded(4).text_color(t.dim).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
       .on_click((_e, cx) => { this.selected = null; this.details = null; this.diff = null; cx.notify(); }).child("×");
+    const toDrawer = div().id("graph-details-drawer").px(6).py(1).rounded(4).text_color(t.dim).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .on_click((_e, cx) => this.setView("drawer", cx)).child("Drawer");
     if (this.diff) {
       const rows = this.diff.rows;
       return v_flex().flex_none().h(this.detailHeight())
         .child(grip)
         .child(top.child(div().id("graph-diff-back").px(6).py(1).rounded(4).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
             .on_click((_e, cx) => { this.diff = null; cx.notify(); }).child("← Files"))
-          .child(div().flex_1().min_w(0).truncate().font_family(mono).text_color(t.foreground).child(this.diff.path)).child(close))
+          .child(div().flex_1().min_w(0).truncate().font_family(mono).text_color(t.foreground).child(this.diff.path)).child(toDrawer).child(close))
         .child(div().flex_1().min_h(0).relative().font_family(mono).text_size(11)
           .when(!rows, (e) => e.child(div().p(12).text_color(t.dim).child("Loading diff…")))
           .when(Boolean(rows), (e) => e.child(div().id(`${this.diffId}-x`).size_full().overflow_x_scrollbar()
@@ -852,7 +1076,7 @@ export class Graph {
       .child(top.child(div().flex_1().text_color(t.muted).child(title))
         .when(Boolean(commit.uncommitted), (e) => e.child(div().id("graph-open-changes").px(6).py(1).rounded(4).text_color(t.accent).cursor_pointer().hover((s) => s.bg(t.hover))
           .on_click(() => showChanges()).child("Open Changes")))
-        .child(close))
+        .child(toDrawer).child(close))
       .child(content);
     if (d?.error) return pane(body.child(div().text_color(t.ansi1).child(d.error)));
     const meta = (k, v, color) => h_flex().gap(8).text_size(11.5).child(div().w(64).flex_none().text_color(t.dim).child(k)).child(div().min_w(0).truncate().text_color(color ?? t.muted).child(v));
@@ -935,17 +1159,16 @@ export class Graph {
       })
       .on_size_change((size, cx) => {
         const width = size.width / this.unit(), wide = width >= 600, graphMax = Math.max(60, Math.round(width * 0.4));
-        this.width = width;
-        // The details strip fills what the history leaves, so it needs the pane's height too.
-        const height = size.height / this.unit(), resized = height !== this.height && Boolean(this.selected);
-        this.height = height;
+        // An open drawer lays its columns out by the width; the strip fills what the history leaves.
+        const height = size.height / this.unit(), resized = (width !== this.width || height !== this.height) && Boolean(this.selected);
+        this.width = width; this.height = height;
         if (wide !== this.wide || graphMax !== this.graphMax || resized) { this.wide = wide; this.graphMax = graphMax; cx.notify(); }
       })
       .child(this.header(t))
       .when(this.state === "workspace", (e) => e.child(this.workspaceList(t)))
       .when(Boolean(this.picking && this.workspace && this.opened), (e) => e.child(this.picker(t)))
       .when(ready, (e) => e.child(this.toolbar(t)).child(this.columns(t, this.graphWidth())).child(this.list(t, mono))
-        .when(Boolean(this.selected), (el) => el.child(this.detailsPane(t, mono))))
+        .when(Boolean(this.selected) && this.view() === "panel", (el) => el.child(this.detailsPane(t, mono))))
       .when(!ready && this.state !== "workspace", (e) => e.child(this.empty(t)));
   }
 }
