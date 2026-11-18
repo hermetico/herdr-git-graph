@@ -37,6 +37,10 @@ extension).
   just the current one, from the toolbar.
 - **Uncommitted changes** sit on top as their own row, joined to HEAD by a dashed
   line.
+- **Issue linking.** In the gear's settings, a regex such as `(PROJ-\d+)` and a URL such as
+  `https://example.atlassian.net/browse/$1` turn issue keys into links: in the history's
+  messages, and in the drawer's and panel's commit message, plus an Issue line for each key in
+  the subject. One rule covers every repository.
 - **Double-click a branch label** to check it out. A remote branch with no local
   one asks for the local name first.
 - **Right-click** what's under the pointer:

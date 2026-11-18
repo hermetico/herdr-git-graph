@@ -5,7 +5,7 @@ import { div, svg, PathBuilder } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar, v_virtual_list, VirtualListScrollHandle } from "gpui-base";
 import { spaces, panes, focused, layout, exec, watchFolder, readTextFile, theme, settings, props, shared, setShared, openOverlay, home, notify, knownAgents, updates, run } from "herdr";
 import { layoutLanes } from "./lanes.js";
-import { fileTree, wrapText } from "./drawer.js";
+import { ISSUES, fileTree, issueAt, issueParts, issueRule, wrapText } from "./drawer.js";
 import { READ, STATUS, UNCOMMITTED, LABEL, logArgs, parseLog, parseStatus, withUncommitted, labelsOf, hitLabel,
   menuFor, menuHeight, fileArgs, joinFiles, diffArgs, diffRows } from "./git.js";
 import { perform, openDialog, showChanges } from "./act.js";
@@ -516,6 +516,32 @@ export class Graph {
   // What the lines' coordinates are multiplied by: nothing where Herdr zooms them itself.
   pathScale() { return listsZoom() ? 1 : this.unit(); }
 
+  // Issue linking's rule, compiled again only when the setting changes.
+  issues() {
+    const raw = shared(ISSUES) ?? null, key = JSON.stringify(raw);
+    if (this.issueKey !== key) { this.issueKey = key; this.issueRule = issueRule(raw); this.issueCache = new Map(); }
+    return this.issueRule;
+  }
+  subjectParts(commit) {
+    const rule = this.issues();
+    if (!rule) return [{ text: commit.subject }];
+    let parts = this.issueCache.get(commit.hash);
+    if (!parts) { parts = issueParts(commit.subject, rule); this.issueCache.set(commit.hash, parts); }
+    return parts;
+  }
+
+  // The issue link under a press in a commit row. Rows can't measure their text, so the subject's
+  // characters are counted at the interface font's width: exact for a monospace font, close otherwise.
+  issueHit(commit, x) {
+    const parts = this.subjectParts(commit);
+    if (parts.length < 2 && !parts[0]?.url) return null;
+    let start = this.graphWidth() + LABEL.GAP;
+    for (const l of this.labels.get(commit.hash) ?? []) start += l.width + LABEL.GAP;
+    if (x < start || x >= this.labelLimit()) return null;
+    const font = String(settings().ui_font_family ?? settings().ui_font ?? ""), ch = 12.5 * (/mono|menlo|meslo|courier|code/i.test(font) ? 0.6 : 0.55);
+    return issueAt(parts, Math.floor((x - start) / ch), 1);
+  }
+
   // A left press, then on release the list names the row: together, a click on a label.
   clicked(key, cx) {
     const press = this.press; this.press = null;
@@ -523,6 +549,8 @@ export class Graph {
     if (key.startsWith("drawer:")) return this.drawerClick(key, press, cx);
     const commit = this.commits[this.index.get(key)];
     if (!commit) return;
+    const url = press && press.count < 2 ? this.issueHit(commit, press.x) : null;
+    if (url) { cx.open_url(url); return; }
     if (press?.count >= 2) {
       const hit = hitLabel(this.labels.get(key), press.x, this.graphWidth(), this.labelLimit());
       if (hit) this.checkout(hit.part, cx);
@@ -581,13 +609,19 @@ export class Graph {
     if (item.kind === "head" || item.kind === "diffhead") {
       act = x >= item.closeFrom ? { close: true } : x >= item.panelFrom ? { panel: true } : item.kind === "diffhead" && x < item.backTo ? { back: true } : null;
     }
-    else act = (item.split !== null && x >= item.split ? item.right : item.left)?.act ?? null;
+    else {
+      const cell = item.split !== null && x >= item.split ? item.right : item.left;
+      // A message line is monospace, so its characters place the click exactly.
+      const url = cell?.parts ? issueAt(cell.parts, Math.floor((x - item.textFrom) / (11.5 * MONO_CH))) : null;
+      act = url ? { url } : cell?.act ?? null;
+    }
     if (!act) return;
     if (act.panel) return this.setView("panel", cx);
     if (act.back) { this.diff = null; this.scroll.scroll_to_item(this.index.get(this.selected), "top"); }
     else if (act.close) { this.selected = null; this.details = null; this.diff = null; }
     else if (act.diff) return this.openDiff(commit, act.diff, cx);
     else if (act.changes) return showChanges();
+    else if (act.url) { cx.open_url(act.url); return; }
     else if (act.copy) { cx.write_to_clipboard(act.copy); notify({ title: "Git Graph", body: `Copied ${act.copy.slice(0, 12)}` }); return; }
     else if (act.select) {
       const parent = this.commits[this.index.get(act.select)];
@@ -699,11 +733,35 @@ export class Graph {
       // Labels and description clip together, so many labels never push the fixed columns out.
       .child(h_flex().flex_1().min_w(0).h_full().gap(LABEL.GAP).items_center().overflow_hidden()
         .children(this.labels.get(commit.hash).map((l) => this.label(l, color, t, mono)))
-        .child(div().flex_1().min_w(0).truncate().text_color(fg).when(commit.head, (e) => e.font_semibold()).child(commit.subject)))
+        .child(this.subject(commit, fg, t).flex_1().min_w(0).when(commit.head, (e) => e.font_semibold())))
       .child(div().w(this.cols.date).flex_none().text_right().truncate().text_color(t.dim).child(commit.uncommitted ? "*" : ago(commit.time)))
       .when(this.wide, (e) => e
         .child(div().w(this.cols.author).flex_none().truncate().text_color(t.muted).child(commit.uncommitted ? "*" : commit.author))
         .child(div().w(this.cols.hash).flex_none().font_family(mono).text_size(11).text_color(t.dim).child(commit.uncommitted ? "*" : commit.hash.slice(0, 8))));
+  }
+
+  // A commit's subject, its issue keys drawn as links. Without any, one truncating line.
+  subject(commit, fg, t) {
+    const parts = this.subjectParts(commit);
+    if (parts.length === 1 && !parts[0].url) return div().truncate().text_color(fg).child(commit.subject);
+    return h_flex().overflow_hidden().text_color(fg).children(parts.map((p, i) => div().whitespace_nowrap()
+      .when(i === parts.length - 1, (e) => e.min_w(0).truncate()).when(i < parts.length - 1, (e) => e.flex_none())
+      .when(Boolean(p.url), (e) => e.text_color(t.accent).underline().cursor_pointer())
+      .child(p.text)));
+  }
+
+  // One line of a commit message, its issue keys as links. `click` makes each link a button,
+  // where the element can hold a handler; in the drawer the list places the click instead.
+  messageLine(text, color, t, click) {
+    const rule = this.issues(), parts = rule ? issueParts(text, rule) : null;
+    // Plain lines wrap in the panel, as before; the drawer's are already wrapped to fit.
+    if (!parts || !parts.some((p) => p.url)) return click ? div().text_color(color).child(text || " ") : div().min_w(0).truncate().text_color(color).child(text || " ");
+    return h_flex().min_w(0).overflow_hidden().text_color(color).children(parts.map((p, i) => {
+      const e = div().whitespace_nowrap().when(i === parts.length - 1, (el) => el.min_w(0).truncate()).when(i < parts.length - 1, (el) => el.flex_none());
+      if (!p.url) return e.child(p.text);
+      const link = e.text_color(t.accent).underline().cursor_pointer().hover((s) => s.text_color(t.foreground)).child(p.text);
+      return click ? link.id(`${click}-${i}`).on_click((_ev, cx) => cx.open_url(p.url)) : link;
+    }));
   }
 
   iconButton(id, glyph, tip, active, action, t) {
@@ -719,7 +777,7 @@ export class Graph {
     // Opened from the Manygit list: "‹ Manygit" goes back to it, the repository's name
     // drops the same rows down over the graph to switch to another.
     const repo = ws && this.opened ? ws.repos.find((r) => r.path === this.opened) : null;
-    const settingsShown = this.state === "workspace" || (this.state === "norepo" && !this.skipped);
+    const settingsShown = ready || this.state === "workspace" || (this.state === "norepo" && !this.skipped);
     return h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
       .when(!repo, (e) => e.child(div().text_size(13).font_semibold().child(ws ? "Manygit" : "Git")))
       // The repository's folder name beside the title.
@@ -767,7 +825,7 @@ export class Graph {
   }
 
   openSettings() {
-    openOverlay({ mod: "git-graph", kind: "popup", at: "pointer", width: 240, height: 92, props: { role: "settings" } });
+    openOverlay({ mod: "git-graph", kind: "popup", at: "pointer", width: 320, height: 248, props: { role: "settings" } });
   }
 
   // Manygit's repository pane: grouped by folder, each row its branch, uncommitted
@@ -963,8 +1021,13 @@ export class Graph {
       { key: "Date", value: `${stamp(commit.time)} · ${ago(commit.time)}` },
     ];
     if (d?.committer && d.committer !== commit.author) lines.push({ key: "Committer", value: d.committer });
+    for (const p of this.subjectParts(commit)) if (p.url) lines.push({ key: "Issue", value: p.text, color: "accent", act: { url: p.url } });
     const body = d ? d.message.split("\n").slice(1).join("\n").trim() : "";
-    if (body) lines.push({ text: "" }, ...wrapText(body, chars).map((text) => ({ text, mono: true, color: "muted" })));
+    const rule = this.issues();
+    if (body) lines.push({ text: "" }, ...wrapText(body, chars).map((text) => {
+      const parts = rule ? issueParts(text, rule) : null;
+      return { text, mono: true, color: "muted", parts: parts?.some((p) => p.url) ? parts : null };
+    }));
     return lines;
   }
 
@@ -1002,7 +1065,7 @@ export class Graph {
     const lines = g.split === null
       ? [...left.map((c) => ({ left: c })), { left: { text: "" } }, ...right.map((c) => ({ left: c }))]
       : Array.from({ length: Math.max(left.length, right.length) }, (_x, i) => ({ left: left[i] ?? null, right: right[i] ?? null }));
-    return [head, ...lines.map((l, i) => ({ key: `${base}:${i}`, kind: "line", h: DRAWER_ROW, split: g.split, filesW: g.filesW, ...l })), pad("bottom")];
+    return [head, ...lines.map((l, i) => ({ key: `${base}:${i}`, kind: "line", h: DRAWER_ROW, split: g.split, filesW: g.filesW, textFrom: g.start, ...l })), pad("bottom")];
   }
 
   drawerCell(c, t, mono) {
@@ -1033,6 +1096,7 @@ export class Graph {
         .when(f.add > 0, (e) => e.child(div().flex_none().text_size(11).text_color(t.ansi2).child(`+${f.add}`)))
         .when(f.del > 0, (e) => e.child(div().flex_none().text_size(11).text_color(t.ansi1).child(`−${f.del}`)));
     }
+    if (c.parts) return this.messageLine(c.text, color(c.color) ?? t.foreground, t, null).font_family(mono).text_size(11.5);
     return link(div().min_w(0).truncate().when(Boolean(c.bold), (e) => e.font_semibold()).when(Boolean(c.mono), (e) => e.font_family(mono).text_size(11.5))
       .text_color(color(c.color) ?? t.foreground).child(c.text || " "));
   }
@@ -1109,7 +1173,9 @@ export class Graph {
     const meta = (k, v, color) => h_flex().gap(8).text_size(11.5).child(div().w(64).flex_none().text_color(t.dim).child(k)).child(div().min_w(0).truncate().text_color(color ?? t.muted).child(v));
     // The history already has the header: it shows at once, and what git adds lands below it.
     const head = commit.uncommitted ? body : body
-      .child(div().font_semibold().child(commit.subject))
+      .child(this.subject(commit, t.foreground, t).font_semibold())
+      .children(this.subjectParts(commit).filter((p) => p.url).map((p, i) => meta("Issue", p.text, t.accent).id(`graph-issue-${i}`).cursor_pointer()
+        .on_click((_e, cx) => cx.open_url(p.url))))
       .child(meta("Commit", commit.hash, t.accent).font_family(mono))
       .child(meta("Parents", commit.parents.map((p) => p.slice(0, 8)).join(", ") || "none"))
       .child(meta("Author", `${commit.author} <${commit.email}>`))
@@ -1119,7 +1185,7 @@ export class Graph {
     const lines = commit.uncommitted ? "" : d.message.split("\n").slice(1).join("\n").trim();
     return pane(head
       .when(Boolean(d.committer && d.committer !== d.author), (el) => el.child(meta("Committer", d.committer)))
-      .when(Boolean(lines), (el) => el.child(v_flex().pt(6).children(lines.split("\n").map((line) => div().text_color(t.muted).child(line || " ")))))
+      .when(Boolean(lines), (el) => el.child(v_flex().pt(6).children(lines.split("\n").map((line, i) => this.messageLine(line, t.muted, t, `graph-msg-${i}`)))))
       .child(h_flex().pt(8).pb(2).gap(8).items_center().text_size(11.5)
         .child(div().text_color(t.muted).child(count(d.files.length + d.more, "file")))
         .when(add > 0 || del > 0, (e) => e.child(div().text_color(t.ansi2).child(`+${add}`)).child(div().text_color(t.ansi1).child(`−${del}`))))

@@ -48,3 +48,45 @@ export function wrapText(text, width) {
   }
   return out;
 }
+
+/** Shared key for issue linking: { regex, url }, the same for every repository. */
+export const ISSUES = "git-graph.issues";
+
+/** Issue linking, as Git Graph does it: a regex and a URL where $1, $2… stand for its groups and
+ *  $0 for the whole match. Returns { re, url }, or null when either is empty or the regex is invalid. */
+export function issueRule(rule) {
+  const pattern = String(rule?.regex ?? "").trim(), url = String(rule?.url ?? "").trim();
+  if (!pattern || !/^https?:\/\/\S+$/.test(url)) return null;
+  try { return { re: new RegExp(pattern, "g"), url }; } catch { return null; }
+}
+
+/** The issue URL for one match: $n is group n, or the whole match when the regex has no such group. */
+const issueUrl = (url, m) => url.replace(/\$(\d)/g, (_s, n) => encodeURIComponent(m[Number(n)] ?? m[0]));
+
+/** Text cut into parts at each issue match: { text } or { text, url }. Without a rule, one part. */
+export function issueParts(text, rule) {
+  text = String(text ?? "");
+  if (!rule) return [{ text }];
+  const out = [];
+  let at = 0;
+  rule.re.lastIndex = 0;
+  for (const m of text.matchAll(rule.re)) {
+    if (!m[0]) continue;
+    if (m.index > at) out.push({ text: text.slice(at, m.index) });
+    out.push({ text: m[0], url: issueUrl(rule.url, m) });
+    at = m.index + m[0].length;
+  }
+  if (at < text.length || !out.length) out.push({ text: text.slice(at) });
+  return out;
+}
+
+/** The link at character `col` of the parts, or null. `slack` widens each link by that many characters. */
+export function issueAt(parts, col, slack = 0) {
+  let at = 0;
+  for (const p of parts) {
+    const end = at + p.text.length;
+    if (p.url && col >= at - slack && col < end + slack) return p.url;
+    at = end;
+  }
+  return null;
+}

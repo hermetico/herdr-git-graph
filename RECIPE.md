@@ -30,8 +30,7 @@ Top to bottom:
   and the name at 11.5px semibold; detached HEAD reads `detached at <8 chars>`
   with a commit icon. On the right, 24px icon buttons in `muted`: Fetch (arrow
   down, only when the repo has remotes; it says `Fetching…` while running) and
-  Refresh, and Settings (a gear) on the Manygit list and when a folder holds
-  none. No commit count, as in
+  Refresh, Settings (a gear), and last Open in a new tab. No commit count, as in
   Git Graph.
 - **Manygit**, when the folder isn't a repository but holds some, after
   [manygit](https://github.com/rabeeh-ta/manygit)'s repository pane, in place of
@@ -74,7 +73,13 @@ Top to bottom:
   failed` as its token, until a later fetch of it works. It goes on if a
   repository is opened, and ends with a toast (`Fetched 12 repositories`, or
   `Fetched 10 of 12 repositories`, a warning).
-  Settings opens a 240px popup with two 30px rows and no other text: `Scan
+  Settings opens a 320px popup. Issue linking sits below a divider: `Regex` and `URL`
+  inputs saved together as `shared("git-graph.issues")` `{ regex, url }` once both make a
+  valid rule, the URL http(s) with `$1` for the first group; emptying both clears it.
+  Matches in subjects and messages draw in `accent`, underlined, with a pointer. History
+  rows can't hold handlers, so a click there is placed by counting characters at the
+  interface font's width; the drawer's message lines are monospace, so theirs is exact.
+  Above it, two 30px rows: `Scan
   depth` and a 56px input holding the depth (1 to 5, 3 by default, manygit's;
   `shared("git-graph.depth")`), and `Show tags` with a checkbox, off by
   default (`shared("git-graph.tags")`), as manygit's `t`. A valid depth applies
@@ -288,8 +293,8 @@ or `ansi1` when the action or the chosen mode destroys something.
   `"dialog"` (`kind: "dialog", width: 420, height` computed from its fields).
   `ctx` carries root, machine, current branch, HEAD, local branches, remotes.
   `"update"` (`kind: "dialog", width: 460, height: 400`): the update window.
-  `"settings"` (`kind: "popup", at: "pointer", width: 240, height: 92`): the
-  Manygit scan depth and Show tags (`settings.js`).
+  `"settings"` (`kind: "popup", at: "pointer", width: 320, height: 248`): the
+  Manygit scan depth, Show tags and issue linking (`settings.js`).
 - `repos.js`: Manygit's `find` arguments, its output as grouped repositories,
   the one-call status and its parse, and the sync token; pure, so the tests
   run them on real folders.
