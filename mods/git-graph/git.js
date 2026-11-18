@@ -79,7 +79,7 @@ export function withUncommitted(commits, changes, head) {
 // Labels are drawn at these exact widths (monospace text, fixed padding and
 // icon), so a press can be matched to the label under it: a virtual list's
 // rows can't hold their own handlers.
-export const LABEL = { CHAR: 6.6, PAD: 5, ICON: 13, GAP: 6, MAX: 22, FONT: 11 };
+export const LABEL = { CHAR: 6.6, PAD: 5, ICON: 13, GAP: 6, MAX: 40, FONT: 11 };
 const fit = (s, n) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
 const partWidth = (part) => Math.ceil(LABEL.PAD * 2 + (part.icon ? LABEL.ICON : 0) + part.text.length * LABEL.CHAR) + 1;
 
@@ -103,8 +103,14 @@ export function labelsOf(commit, remotesShown = true) {
   // What's checked out comes first.
   labels.sort((a, b) => Number(Boolean(b.head)) - Number(Boolean(a.head)));
   for (const label of labels) {
-    for (const part of label.parts) part.width = partWidth(part);
+    for (const part of label.parts) {
+      part.width = partWidth(part);
+      // The whole text, shown while hovered: a remote part paired with its branch is the remote's name.
+      part.full = part.kind === "remote" && label.parts[0] !== part ? part.name.slice(0, part.name.indexOf("/")) : part.name;
+      part.fullWidth = partWidth({ ...part, text: part.full });
+    }
     label.width = label.parts.reduce((n, p) => n + p.width, 2); // + a 1 px border each side
+    label.full = label.parts.reduce((n, p) => n + p.fullWidth, 2);
   }
   return labels;
 }

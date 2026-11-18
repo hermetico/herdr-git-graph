@@ -584,7 +584,7 @@ export class Graph {
     else act = (item.split !== null && x >= item.split ? item.right : item.left)?.act ?? null;
     if (!act) return;
     if (act.panel) return this.setView("panel", cx);
-    if (act.back) this.diff = null;
+    if (act.back) { this.diff = null; this.scroll.scroll_to_item(this.index.get(this.selected), "top"); }
     else if (act.close) { this.selected = null; this.details = null; this.diff = null; }
     else if (act.diff) return this.openDiff(commit, act.diff, cx);
     else if (act.changes) return showChanges();
@@ -673,15 +673,19 @@ export class Graph {
   label(label, color, t, mono) {
     const current = label.kind === "branch" && label.head;
     const edge = label.kind === "tag" ? t.ansi3 : label.kind === "head" ? t.accent : color;
+    // A shortened name shows whole while the pointer is on its label.
     return h_flex().flex_none().w(label.width).h(18).rounded(5).border_1().border_color(edge).overflow_hidden()
+      .when(label.full > label.width, (e) => e.hover((s) => s.w(label.full)))
       .when(current, (e) => e.bg(color)).when(label.kind === "head", (e) => e.bg(t.accent))
       .children(label.parts.map((part, i) => {
         const fg = current || part.kind === "head" ? t.background : part.kind === "tag" ? t.ansi3 : i > 0 ? t.muted : t.foreground;
         const glyph = part.kind === "branch" ? (part.head ? "check" : "branch") : part.kind === "tag" ? "tag" : "cloud";
-        return h_flex().w(part.width).h_full().flex_none().px(LABEL.PAD).gap(3).items_center().overflow_hidden()
+        const cut = part.full !== part.text;
+        return h_flex().h_full().px(LABEL.PAD).gap(3).items_center().overflow_hidden()
+          .when(cut, (e) => e.flex_1().min_w(0)).when(!cut, (e) => e.w(part.width).flex_none())
           .when(i > 0, (e) => e.border_l(1).border_color(edge).bg(current ? t.background + "33" : edge + "1f"))
           .when(Boolean(part.icon), (e) => e.child(svg(icon(glyph)).size(10).flex_none().text_color(fg)))
-          .child(div().font_family(mono).text_size(LABEL.FONT).when(current, (e) => e.font_semibold()).text_color(fg).child(part.text));
+          .child(div().font_family(mono).text_size(LABEL.FONT).when(current, (e) => e.font_semibold()).text_color(fg).when(cut, (e) => e.min_w(0).truncate()).child(part.full));
       }));
   }
 
@@ -741,9 +745,9 @@ export class Graph {
         const run = this.fetchAll?.root === ws.root ? this.fetchAll : null;
         return e.child(this.iconButton("graph-fetch-all", "fetch", run ? `Fetching ${run.done}/${run.total}…` : "Fetch all", Boolean(run), (_e, cx) => this.fetchEvery(cx), t));
       })
-      .when(this.canMoveToTab(), (e) => e.child(this.iconButton("graph-tab", "tab", null, false, () => this.moveToTab(), t)))
       .when(this.state !== "nofolder", (e) => e.child(this.iconButton("graph-refresh", "refresh", null, false, (_e, cx) => this.refresh(cx), t)))
-      .when(settingsShown, (e) => e.child(this.iconButton("graph-settings", "settings", null, false, () => this.openSettings(), t)));
+      .when(settingsShown, (e) => e.child(this.iconButton("graph-settings", "settings", null, false, () => this.openSettings(), t)))
+      .when(this.canMoveToTab(), (e) => e.child(this.iconButton("graph-tab", "tab", null, false, () => this.moveToTab(), t).tooltip("Open in a new tab")));
   }
 
   // A pane pinned to a folder moves to a tab of its own; the side panel opens one and stays.
@@ -871,6 +875,7 @@ export class Graph {
     const drawer = sel === undefined || this.view() !== "drawer" ? [] : this.drawerItems(this.commits[sel], width);
     this.drawerKeys = new Map(drawer.map((d) => [d.key, d]));
     this.lastDrawer = drawer.length ? { sel, len: drawer.length } : null;
+    if (this.diff && drawer.length) return this.diffView(sel, drawer[0], t, colors, mono, width);
     const n = drawer.length, total = this.commits.length + n, count = total + (this.hasMore ? 1 : 0);
     const at = (i) => (sel === undefined || i <= sel ? { commit: i } : i <= sel + n ? { drawer: drawer[i - sel - 1] } : i < total ? { commit: i - n } : { more: true });
     const sizes = n ? Array.from({ length: count }, (_x, i) => { const a = at(i); return a.drawer ? this.listSize(a.drawer.h) : this.listRow(); }) : this.listRow();
@@ -897,6 +902,30 @@ export class Graph {
         .on_item_secondary_click((key, e, cx) => this.contextMenu(key, e, cx))
         .size_full())
       .child(Scrollbar.vertical(this.listId).viewport_from_layout().absolute().inset_0());
+  }
+
+  // A file's diff in drawer mode: its commit's row, the drawer's header, then the diff filling the
+  // rest of the view in a scroll of its own, so a long diff never stretches the history. Back
+  // returns to the history with the commit at the top.
+  diffView(sel, head, t, colors, mono, width) {
+    const rows = this.diff.rows ?? [{ kind: "", text: "Loading diff…" }], lanes = this.throughLanes(sel, colors, t);
+    const z = this.pathScale(), x = (lane) => (PAD + lane * LANE + LANE / 2) * z, tall = 4000;
+    const id = `${this.listId}-drawer-diff`;
+    return v_flex().flex_1().min_h(0)
+      .on_mouse_down("left", (e) => { this.press = { x: (e.local_position?.x ?? 0) / this.unit(), count: e.click_count }; })
+      .child(div().id("graph-diff-commit").flex_none().cursor_pointer().child(this.row(sel, t, colors, mono, width))
+        .on_click((_e, cx) => { this.diff = null; this.scroll.scroll_to_item(sel, "top"); cx.notify(); }))
+      .child(div().id("graph-diff-head").flex_none().child(this.drawerRow(head, t, mono, width, lanes))
+        .on_click((_e, cx) => { const press = this.press; this.press = null; this.drawerClick(head.key, press, cx); }))
+      .child(div().flex_1().min_h(0).relative().overflow_hidden().bg(t.chrome ?? t.raised)
+        .child(h_flex().size_full().child(div().flex_none().w(width).h_full())
+          .child(div().flex_1().min_w(0).h_full().pl(LABEL.GAP).font_family(mono).text_size(11)
+            .child(v_virtual_list(id, rows.length, DIFF_ROW, (i) => String(i),
+              (range) => rows.slice(range.start, range.end).map((r) => this.diffRow(r, t))).size_full())))
+        .child(div().absolute().top(0).left(0).size_full().border_l(1).border_r(1).border_b(1).border_color(t.border))
+        .children(lanes.map((l) => window.paint_path(PathBuilder.stroke(1.5 * z).move_to(x(l.lane), 0).line_to(x(l.lane), tall * z).build(), l.color)
+          .absolute().top(0).left(0).w(width).h(tall)))
+        .child(Scrollbar.vertical(id).viewport_from_layout().absolute().inset_0()));
   }
 
   // An item's height in the list's units: as the rows, screen pixels where Herdr doesn't zoom lists.
@@ -954,9 +983,9 @@ export class Graph {
   // Built again only when what it shows changes, not on every frame.
   drawerItems(commit, graphW) {
     const c = this.drawerCache;
-    if (c && c.commit === commit && c.details === this.details && c.diff === this.diff && c.graphW === graphW && c.width === this.width) return c.items;
+    if (c && c.commit === commit && c.details === this.details && c.diff === this.diff && c.graphW === graphW && c.width === this.width && c.height === this.height) return c.items;
     const items = this.buildDrawer(commit, graphW);
-    this.drawerCache = { commit, details: this.details, diff: this.diff, graphW, width: this.width, items };
+    this.drawerCache = { commit, details: this.details, diff: this.diff, graphW, width: this.width, height: this.height, items };
     return items;
   }
 
@@ -965,12 +994,8 @@ export class Graph {
     const head = { key: `${base}:head`, kind: "head", h: DRAWER_HEAD, split: null, panelFrom: g.start + g.w - 72, closeFrom: g.start + g.w - 22 };
     const pad = (k) => ({ key: `${base}:${k}`, kind: "pad", h: DRAWER_PAD, split: null, edge: k });
     if (this.diff) {
-      const rows = this.diff.rows ?? [{ kind: "", text: "Loading diff…" }];
-      return [
-        { key: `${base}:diffhead`, kind: "diffhead", h: 28, split: null, backTo: g.start + 72, panelFrom: g.start + g.w - 72, closeFrom: g.start + g.w - 22 },
-        ...rows.map((row, i) => ({ key: `${base}:diff:${i}`, kind: "diff", h: DIFF_ROW, split: null, row })),
-        pad("bottom"),
-      ];
+      // A diff isn't part of the list: diffView shows it under its commit, in a scroll of its own.
+      return [{ key: `${base}:diffhead`, kind: "diffhead", h: 28, split: null, backTo: g.start + 72, panelFrom: g.start + g.w - 72, closeFrom: g.start + g.w - 22 }];
     }
     const leftW = g.split === null ? g.w : g.split - g.start - 12;
     const left = this.detailLines(commit, this.details, (leftW - 12) / (11.5 * MONO_CH)), right = this.fileLines(this.details);
@@ -1016,27 +1041,29 @@ export class Graph {
   drawerRow(item, t, mono, graphW, lanes) {
     // Painted as the graph's own lines are, so they meet them exactly.
     const z = this.pathScale(), x = (lane) => (PAD + lane * LANE + LANE / 2) * z;
-    const graph = div().relative().flex_none().w(graphW).h(item.h).overflow_hidden()
-      .children(lanes.map((l) => window.paint_path(PathBuilder.stroke(1.5 * z).move_to(x(l.lane), 0).line_to(x(l.lane), item.h * z).build(), l.color)
-        .absolute().top(0).left(0).size_full()));
-    // The drawer is a box beside the graph column: its background and its edges start after the
-    // lanes, so they run through it unbroken and the box keeps one shape.
-    const row = (body) => h_flex().id(item.key).w_full().h(item.h).flex_none().overflow_hidden().text_size(11.5)
-      .child(graph).child(body);
-    const body = h_flex().flex_1().min_w(0).h_full().pl(LABEL.GAP).pr(10).gap(LABEL.GAP).items_center()
-      .bg(t.chrome ?? t.raised).border_l(1).border_color(t.border)
-      .when(item.edge === "bottom", (e) => e.border_b(1).border_color(t.border))
-      .when(item.kind === "head" || item.kind === "diffhead", (e) => e.border_t(1).border_color(t.border));
+    // The drawer is one box across the whole width. Its border and the lanes are overlays drawn
+    // over it, so the border takes no room and the lanes stay where the graph's rows draw them,
+    // running over the border unbroken.
+    const frame = div().absolute().top(0).left(0).size_full().border_color(t.border).border_l(1).border_r(1)
+      .when(item.edge === "bottom", (e) => e.border_b(1))
+      .when(item.kind === "head" || item.kind === "diffhead", (e) => e.border_t(1));
+    const paths = lanes.map((l) => window.paint_path(PathBuilder.stroke(1.5 * z).move_to(x(l.lane), 0).line_to(x(l.lane), item.h * z).build(), l.color)
+      .absolute().top(0).left(0).size_full());
+    const row = (body) => h_flex().id(item.key).relative().w_full().h(item.h).flex_none().overflow_hidden().text_size(11.5)
+      .bg(t.chrome ?? t.raised)
+      .child(div().flex_none().w(graphW).h_full()).child(body).child(frame).children(paths);
+    const body = h_flex().flex_1().min_w(0).h_full().pl(LABEL.GAP).pr(10).gap(LABEL.GAP).items_center();
     if (item.kind === "pad") return row(body);
     const link = (text, w) => div().w(w).flex_none().text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground)).child(text);
-    const tail = (e) => e.child(link("Panel", 72 - 22 - LABEL.GAP).text_right()).child(link("×", 22 - LABEL.GAP).text_center());
+    const toPanel = div().w(72 - 22 - LABEL.GAP).flex_none().flex().justify_end().text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground))
+      .child(svg(icon("panel")).size(13));
+    const tail = (e) => e.child(toPanel).child(link("×", 22 - LABEL.GAP).text_center());
     if (item.kind === "head") return row(tail(body.child(div().flex_1())));
     if (item.kind === "diffhead") {
       return row(tail(body
         .child(div().w(72 - LABEL.GAP).flex_none().text_color(t.muted).cursor_pointer().hover((s) => s.text_color(t.foreground)).child("← Files"))
         .child(div().flex_1().min_w(0).truncate().font_family(mono).text_color(t.foreground).child(this.diff?.path ?? ""))));
     }
-    if (item.kind === "diff") return row(body.font_family(mono).text_size(11).child(div().flex_1().min_w(0).h_full().child(this.diffRow(item.row, t))));
     return row(body
       .child(div().flex_1().min_w(0).child(this.drawerCell(item.left, t, mono)))
       .when(item.split !== null, (e) => e.child(div().w(item.filesW).flex_none().h_full().pl(10).border_l(1).border_color(t.border).flex().items_center()
@@ -1053,8 +1080,8 @@ export class Graph {
     const top = h_flex().h(32).flex_none().px(10).gap(6).items_center().border_b(1).border_color(t.border).text_size(11.5);
     const close = div().id("graph-details-close").px(6).py(1).rounded(4).text_color(t.dim).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
       .on_click((_e, cx) => { this.selected = null; this.details = null; this.diff = null; cx.notify(); }).child("×");
-    const toDrawer = div().id("graph-details-drawer").px(6).py(1).rounded(4).text_color(t.dim).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
-      .on_click((_e, cx) => this.setView("drawer", cx)).child("Drawer");
+    const toDrawer = div().id("graph-details-drawer").px(6).py(3).rounded(4).text_color(t.dim).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .tooltip("Show in a drawer under the commit").on_click((_e, cx) => this.setView("drawer", cx)).child(svg(icon("drawer")).size(13));
     if (this.diff) {
       const rows = this.diff.rows;
       return v_flex().flex_none().h(this.detailHeight())
